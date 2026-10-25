@@ -75,11 +75,11 @@ fn goal_line(s: &Summary) -> String {
 // ---------------------------------------------------------------- login
 
 pub fn login(api_arg: Option<String>) -> Result<ExitCode> {
-    let existing = config::load_credentials()?;
     let mut api = Api::new(None)?;
+    // A fresh login ignores the server saved by an earlier one (e.g. a local dev server).
     api.base = api_arg
         .map(|a| a.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| config::api_base(existing.as_ref()));
+        .unwrap_or_else(|| config::api_base(None));
 
     let dc = api.device_code().context("couldn't start sign-in")?;
     let code = if dc.user_code.len() == 8 {
