@@ -1,0 +1,39 @@
+[package]
+name = "prepkitty"
+version = "0.1.0"
+edition = "2021"
+description = "PrepKitty CLI: start, test and submit coding exercises and projects locally."
+license = "MIT"
+repository = "https://github.com/prepkittydev/prepkitty-cli"
+homepage = "https://prepkitty.dev"
+
+[[bin]]
+name = "prepkitty"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+console = "0.15"
+directories = "6"
+flate2 = "1"
+open = "5"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+tempfile = "3"
+toml = "0.8"
+
+[dev-dependencies]
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
