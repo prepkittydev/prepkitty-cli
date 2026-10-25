@@ -10,6 +10,13 @@ use crate::config::{self, Credentials};
 
 pub const CLIENT_ID: &str = "prepkitty-cli";
 
+/// Result of checking a saved login against the server.
+pub enum SessionCheck {
+    Valid(Summary),
+    /// The server rejected the token (expired or revoked).
+    Invalid,
+}
+
 pub struct Api {
     pub base: String,
     token: Option<String>,
@@ -232,6 +239,24 @@ impl Api {
 
     pub fn me(&self) -> Result<Summary> {
         self.get("/api/cli/me")
+    }
+
+    /// Like `me`, but tells an expired/revoked session apart from other failures.
+    pub fn check_session(&self) -> Result<SessionCheck> {
+        let resp = self.send(self.auth(self.http.get(self.url("/api/cli/me"))))?;
+        if resp.status().as_u16() == 401 {
+            return Ok(SessionCheck::Invalid);
+        }
+        Ok(SessionCheck::Valid(self.json(resp)?))
+    }
+
+    /// Ends this token's session on the server. Best effort: errors are ignored.
+    pub fn revoke_session(&self) {
+        let rb = self
+            .http
+            .post(self.url("/api/auth/sign-out"))
+            .json(&serde_json::json!({}));
+        let _ = self.send(self.auth(rb));
     }
 
     pub fn item(&self, id: &str, start: bool) -> Result<Item> {

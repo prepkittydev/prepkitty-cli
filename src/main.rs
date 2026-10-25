@@ -37,8 +37,11 @@ enum Command {
         /// API to sign in to (defaults to PREPKITTY_API or the hosted site).
         #[arg(long)]
         api: Option<String>,
+        /// Sign in again even if already signed in, without asking.
+        #[arg(long)]
+        force: bool,
     },
-    /// Forget the saved login on this computer.
+    /// Sign out on this computer and end the session.
     Logout,
     /// Show who you're signed in as.
     Whoami,
@@ -90,7 +93,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     kitty::set_quiet(cli.no_kitty);
     let result = match cli.command {
-        Command::Login { api } => commands::login(api),
+        Command::Login { api, force } => commands::login(api, force),
         Command::Logout => commands::logout(),
         Command::Whoami => commands::whoami(),
         Command::Start { id, dir } => commands::start(&id, dir),

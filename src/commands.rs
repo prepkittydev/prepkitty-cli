@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use console::style;
 
-use crate::api::{Api, Item, Submission, Summary, TestResult, TokenResponse};
+use crate::api::{Api, Item, SessionCheck, Submission, Summary, TestResult, TokenResponse};
 use crate::config::{self, Credentials};
 use crate::git;
 use crate::kitty::{self, Mood};
@@ -74,12 +75,68 @@ fn goal_line(s: &Summary) -> String {
 
 // ---------------------------------------------------------------- login
 
-pub fn login(api_arg: Option<String>) -> Result<ExitCode> {
+fn who(me: &Summary) -> String {
+    let handle = me
+        .username
+        .as_ref()
+        .map(|u| format!(" (@{u})"))
+        .unwrap_or_default();
+    format!("{}{}", style(&me.name).bold(), handle)
+}
+
+/// Asks a yes/no question; anything but y/yes (including Enter) means no.
+fn confirm(question: &str) -> Result<bool> {
+    print!("{question} [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+pub fn login(api_arg: Option<String>, force: bool) -> Result<ExitCode> {
     let mut api = Api::new(None)?;
     // A fresh login ignores the server saved by an earlier one (e.g. a local dev server).
     api.base = api_arg
         .map(|a| a.trim_end_matches('/').to_string())
         .unwrap_or_else(|| config::api_base(None));
+
+    // The previous login on this server, revoked once the new one succeeds.
+    let mut replaced: Option<Credentials> = None;
+    if let Some(old) = config::load_credentials()? {
+        if old.api != api.base {
+            println!("Switching from {} to {}.", old.api, api.base);
+        } else if force {
+            replaced = Some(old);
+        } else {
+            let mut old_api = Api::new(Some(&old))?;
+            old_api.base = old.api.clone();
+            match old_api.check_session()? {
+                SessionCheck::Invalid => {
+                    println!("Your saved session has expired. Let's sign in again.")
+                }
+                SessionCheck::Valid(me) => {
+                    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+                    if !interactive {
+                        println!(
+                            "Already signed in as {} on {}. Run `prepkitty login --force` to sign in again.",
+                            who(&me),
+                            api.base
+                        );
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    let question = format!(
+                        "Already signed in as {}. Sign in as someone else?",
+                        who(&me)
+                    );
+                    if !confirm(&question)? {
+                        println!("Still signed in as {}.", who(&me));
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    replaced = Some(old);
+                }
+            }
+        }
+    }
 
     let dc = api.device_code().context("couldn't start sign-in")?;
     let code = if dc.user_code.len() == 8 {
@@ -137,6 +194,11 @@ pub fn login(api_arg: Option<String>) -> Result<ExitCode> {
     let me = Api::new(Some(&creds))?.me()?;
     creds.name = Some(me.name.clone());
     config::save_credentials(&creds)?;
+    if let Some(old) = replaced.filter(|o| o.token != creds.token) {
+        let mut old_api = Api::new(Some(&old))?;
+        old_api.base = old.api.clone();
+        old_api.revoke_session();
+    }
     println!();
     kitty::say(
         Mood::Celebrating,
@@ -150,6 +212,11 @@ pub fn login(api_arg: Option<String>) -> Result<ExitCode> {
 }
 
 pub fn logout() -> Result<ExitCode> {
+    if let Some(creds) = config::load_credentials()? {
+        let mut api = Api::new(Some(&creds))?;
+        api.base = creds.api.clone();
+        api.revoke_session();
+    }
     if config::delete_credentials()? {
         println!("Signed out. Your kitty will wait for you.");
     } else {
@@ -161,12 +228,7 @@ pub fn logout() -> Result<ExitCode> {
 pub fn whoami() -> Result<ExitCode> {
     let api = Api::authed()?;
     let me = api.me()?;
-    let handle = me
-        .username
-        .as_ref()
-        .map(|u| format!(" (@{u})"))
-        .unwrap_or_default();
-    println!("{}{} on {}", style(&me.name).bold(), handle, api.base);
+    println!("{} on {}", who(&me), api.base);
     Ok(ExitCode::SUCCESS)
 }
 
