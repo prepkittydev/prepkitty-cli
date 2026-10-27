@@ -17,7 +17,10 @@ use crate::git;
 use crate::kitty::{self, Mood};
 use crate::pack::{self, Pack};
 use crate::runner::{
-    java::Java, python::Python, JavaTestRunner, Runner, StepsRunner, Toolchain, UnittestRunner,
+    java::Java,
+    python::{venv_bin, Python},
+    steps::Launch,
+    JavaTestRunner, Runner, StepsRunner, Toolchain, UnittestRunner,
 };
 use crate::workspace::{self, ItemConfig};
 
@@ -272,6 +275,7 @@ pub fn start(id: &str, dir: Option<PathBuf>) -> Result<ExitCode> {
             kind: m.kind.clone(),
             language: m.language.clone(),
             run: m.run.clone(),
+            build: None,
             stage: if m.kind == "project" {
                 Some(item.current_stage.unwrap_or(1))
             } else {
@@ -406,24 +410,52 @@ fn target_stage(
 }
 
 fn run_tests(pack: &Pack, dir: &Path, stage: u32) -> Result<Vec<TestResult>> {
-    let is_java = pack.manifest.language == "java";
-    if pack.manifest.kind == "project" {
-        let run = pack
-            .manifest
-            .run
-            .clone()
-            .context("project pack has no run command")?;
-        if is_java {
-            return StepsRunner::java(Java::find()?, run, stage).run(pack, dir);
+    let m = &pack.manifest;
+    let is_java = m.language == "java";
+    if m.kind == "project" {
+        let mut run = m.run.clone().context("project pack has no run command")?;
+        let mut build = None;
+        let mut launch = Launch {
+            start_timeout: Duration::from_secs(m.start_timeout_seconds.unwrap_or(10)),
+            ..Launch::default()
+        };
+        if m.any_framework {
+            // The learner picked the framework, so their prepkitty.toml says how
+            // to build and start it.
+            if let Some(config) = workspace::read_config(dir) {
+                let set = |c: Option<String>| c.filter(|c| !c.trim().is_empty());
+                run = set(config.run).unwrap_or(run);
+                build = set(config.build);
+            }
+            launch.from_project = true;
         }
-        let python = Python::find()?.with_requirements(dir, &pack.manifest.requirements)?;
-        StepsRunner {
-            toolchain: Toolchain::Python(python),
+        let toolchain = if is_java {
+            match build {
+                // Their build tool compiled the code (and knows its dependencies).
+                Some(_) => Toolchain::Custom,
+                None => Toolchain::Java {
+                    java: Java::find()?,
+                    classes: PathBuf::new(),
+                },
+            }
+        } else {
+            let mut python = Python::find()?.with_requirements(dir, &m.requirements)?;
+            if m.any_framework {
+                python = python.with_requirements_file(dir)?;
+                launch.path_prefix = venv_bin(dir);
+            }
+            Toolchain::Python(python)
+        };
+        return StepsRunner {
+            toolchain,
             run_command: run,
+            build,
+            launch,
             up_to: stage,
         }
-        .run(pack, dir)
-    } else if is_java {
+        .run(pack, dir);
+    }
+    if is_java {
         JavaTestRunner {
             java: Java::find()?,
         }

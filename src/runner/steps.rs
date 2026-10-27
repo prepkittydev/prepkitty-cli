@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
-use std::process::{Child, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -22,7 +22,6 @@ use crate::api::TestResult;
 use crate::pack::UPDATE_HINT;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
-const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WAIT_MS: u64 = 2000;
 
@@ -38,7 +37,47 @@ pub struct StageTest {
     pub files: BTreeMap<String, String>,
     #[serde(default)]
     pub server: bool,
+    /// Extra environment variables for the server, e.g. `API_TOKEN`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub steps: Vec<Step>,
+}
+
+/// How a project's server is started.
+#[derive(Clone, Debug)]
+pub struct Launch {
+    pub start_timeout: Duration,
+    /// Start from the project folder, not the test's temp folder (which is passed
+    /// as $DATA_DIR instead). Learner-chosen commands like `uvicorn main:app` or
+    /// `java -jar target/app.jar` only work from there.
+    pub from_project: bool,
+    /// Folder put first on PATH (the project's .venv), so its tools resolve.
+    pub path_prefix: Option<PathBuf>,
+}
+
+impl Default for Launch {
+    fn default() -> Self {
+        Launch {
+            start_timeout: Duration::from_secs(10),
+            from_project: false,
+            path_prefix: None,
+        }
+    }
+}
+
+impl Launch {
+    /// Puts `path_prefix` in front of PATH for `cmd`.
+    pub fn apply_path(&self, cmd: &mut Command) {
+        if let Some(prefix) = &self.path_prefix {
+            let mut paths = vec![prefix.clone()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                cmd.env("PATH", joined);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +219,7 @@ pub fn run_stage(
     run_cmd: &str,
     toolchain: &Toolchain,
     runner: &Path,
+    launch: &Launch,
 ) -> Result<Vec<TestResult>> {
     let raw =
         fs::read_to_string(stage_dir.join("tests.json")).context("stage has no tests.json")?;
@@ -208,6 +248,7 @@ pub fn run_stage(
                 (&run, run_cmd),
                 toolchain,
                 runner,
+                launch,
             ) {
                 Ok(()) => TestResult {
                     name: t.name.clone(),
@@ -233,9 +274,42 @@ struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Build tools and reloaders (mvn, gradle, uvicorn --reload) run the real
+        // server as a child process, so kill the whole tree, not just the wrapper.
+        let descendants = descendants(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        for pid in descendants {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status();
+        }
     }
+}
+
+/// Every process below `pid`, found before anything is killed (killed children
+/// get re-parented, and a reloader could respawn them).
+fn descendants(pid: u32) -> Vec<u32> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let Ok(out) = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|p| p.parse::<u32>().ok())
+        .flat_map(|child| {
+            let mut all = vec![child];
+            all.extend(descendants(child));
+            all
+        })
+        .collect()
 }
 
 /// `run` is (expanded command to execute, original command to show the learner).
@@ -246,6 +320,7 @@ fn run_test(
     (run, run_display): (&str, &str),
     toolchain: &Toolchain,
     runner: &Path,
+    launch: &Launch,
 ) -> Result<()> {
     let tmp = tempfile::tempdir()?;
     for (name, content) in &t.files {
@@ -257,7 +332,7 @@ fn run_test(
     }
 
     let server = if t.server {
-        Some(start_server(run, tmp.path())?)
+        Some(start_server(run, tmp.path(), project_dir, &t.env, launch)?)
     } else {
         None
     };
@@ -275,6 +350,7 @@ fn run_test(
                 expect,
             } => {
                 let mut command = process::shell(&cmd.replace("{run}", run));
+                launch.apply_path(&mut command);
                 command.envs(env);
                 let out = process::run(command, tmp.path(), stdin.as_deref(), STEP_TIMEOUT)?;
                 check_run(&cmd.replace("{run}", run_display), &out, expect)?;
@@ -453,12 +529,24 @@ fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-fn start_server(run: &str, cwd: &Path) -> Result<Server> {
+fn start_server(
+    run: &str,
+    tmp: &Path,
+    project_dir: &Path,
+    env: &BTreeMap<String, String>,
+    launch: &Launch,
+) -> Result<Server> {
     let port = free_port()?;
     // Server stderr goes to a file so a chatty server can never block on a full pipe.
     let log = tempfile::NamedTempFile::new()?;
     let mut cmd = process::shell(run);
-    cmd.current_dir(cwd)
+    launch.apply_path(&mut cmd);
+    if launch.from_project {
+        cmd.current_dir(project_dir).env("DATA_DIR", tmp);
+    } else {
+        cmd.current_dir(tmp);
+    }
+    cmd.envs(env)
         .env("PORT", port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -481,9 +569,16 @@ fn start_server(run: &str, cwd: &Path) -> Result<Server> {
                 tail(&err, 1200)
             );
         }
-        if start.elapsed() > SERVER_START_TIMEOUT {
-            let _ = child.kill();
-            anyhow::bail!("your server didn't start listening on port $PORT ({port}) within 10s. Read the port from the PORT environment variable.");
+        if start.elapsed() > launch.start_timeout {
+            let _ = Server {
+                child,
+                port,
+                _log: log,
+            };
+            anyhow::bail!(
+                "your server didn't start listening on port $PORT ({port}) within {}s. Read the port from the PORT environment variable.",
+                launch.start_timeout.as_secs()
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -562,7 +657,13 @@ fn send_http(client: &reqwest::blocking::Client, port: u16, step: &HttpStep) -> 
     let (method, path) = line.split_once(' ').unwrap_or(("GET", line));
     let url = format!("http://127.0.0.1:{port}{path}");
     let mut req = client.request(method.parse()?, &url);
+    // A step can set its own Content-Type (e.g. to send malformed JSON as JSON).
+    let has_type = step
+        .headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"));
     req = match &step.body {
+        Some(Value::String(s)) if has_type => req.body(s.clone()),
         Some(Value::String(s)) => req.header("Content-Type", "text/plain").body(s.clone()),
         Some(v) => req.json(v),
         None => req,
@@ -845,5 +946,105 @@ mod tests {
         )
         .unwrap();
         assert!(out.timed_out);
+    }
+
+    #[test]
+    fn custom_run_is_left_alone_except_for_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("target")).unwrap();
+        fs::write(dir.path().join("target/app.jar"), "").unwrap();
+        let out = expand_run("java -jar target/app.jar", dir.path(), &Toolchain::Custom);
+        assert!(out.starts_with("java -jar "), "{out}");
+        assert!(!out.contains("-cp"), "{out}");
+        assert!(out.contains(
+            &dir.path()
+                .join("target/app.jar")
+                .to_string_lossy()
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn custom_servers_start_in_the_project_with_env_and_die_with_their_children() {
+        if cfg!(windows) {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        // A wrapper that forks the real server (like mvn or a reloader) and records its pid.
+        let run = r#"sh -c 'echo "$API_TOKEN $DATA_DIR" > seen.txt; python3 -m http.server "$PORT" --bind 127.0.0.1 & echo $! > server.pid; wait'"#;
+        fs::write(
+            stage.path().join("tests.json"),
+            r#"{"tests":[{"name":"t","server":true,"env":{"API_TOKEN":"s3cret"},"steps":[
+                {"http":"GET /seen.txt","expect":{"status":200,"bodyContains":["s3cret "]}},
+                {"http":"OPTIONS /seen.txt","expect":{}}]}]}"#,
+        )
+        .unwrap();
+        let launch = Launch {
+            from_project: true,
+            ..Launch::default()
+        };
+        let results = run_stage(
+            stage.path(),
+            project.path(),
+            run,
+            &Toolchain::Custom,
+            Path::new("runner"),
+            &launch,
+        )
+        .unwrap();
+        assert!(results[0].passed, "{:?}", results[0].message);
+        let seen = fs::read_to_string(project.path().join("seen.txt")).unwrap();
+        assert!(
+            seen.trim().len() > "s3cret ".len(),
+            "DATA_DIR missing: {seen}"
+        );
+
+        let pid = fs::read_to_string(project.path().join("server.pid")).unwrap();
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let start = Instant::now();
+        while alive() && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the forked server outlived the test");
+    }
+
+    #[test]
+    fn string_bodies_keep_a_step_content_type() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                head.push_str(&line.to_ascii_lowercase());
+                line.clear();
+            }
+            let _ = reader.get_mut().write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            head
+        });
+        let step = HttpStep {
+            http: "POST /books".into(),
+            body: Some(Value::String("{oops".into())),
+            headers: [("Content-Type".to_string(), "application/json".to_string())].into(),
+            expect: HttpExpect {
+                status: Some(400),
+                ..Default::default()
+            },
+        };
+        send_http(&reqwest::blocking::Client::new(), port, &step).unwrap();
+        let head = seen.join().unwrap();
+        assert_eq!(head.matches("content-type:").count(), 1, "{head}");
+        assert!(head.contains("content-type: application/json"), "{head}");
     }
 }

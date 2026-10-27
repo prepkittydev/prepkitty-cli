@@ -21,6 +21,10 @@ pub struct ItemConfig {
     /// Projects: command that starts the learner's program.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    /// Any-framework projects: command run once in the project folder before the
+    /// tests, e.g. `./mvnw -q -DskipTests package`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// Projects: the stage the learner is working on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<u32>,
@@ -44,6 +48,11 @@ pub fn write_config(dir: &Path, config: &ItemConfig) -> Result<()> {
         format!("{header}{}", toml::to_string(config)?),
     )?;
     Ok(())
+}
+
+/// The prepkitty.toml directly in `dir`, if there is a readable one.
+pub fn read_config(dir: &Path) -> Option<ItemConfig> {
+    toml::from_str(&fs::read_to_string(dir.join(ITEM_FILE)).ok()?).ok()
 }
 
 /// Walks up from `start` to the nearest folder with a prepkitty.toml.

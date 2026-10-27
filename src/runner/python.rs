@@ -1,6 +1,6 @@
 //! Finding a suitable Python and running the bundled unittest runner.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -59,24 +59,52 @@ impl Python {
         if requirements.is_empty() {
             return Ok(self.clone());
         }
-        let venv = project_dir.join(".venv");
-        let venv_python = if cfg!(windows) {
-            venv.join("Scripts").join("python.exe")
-        } else {
-            venv.join("bin").join("python")
+        self.venv(
+            project_dir,
+            requirements,
+            &requirements.join("\n"),
+            &requirements.join(", "),
+        )
+    }
+
+    /// Like `with_requirements`, but for the learner's own `requirements.txt`
+    /// (any-framework projects). Without one, returns `self` unchanged.
+    pub fn with_requirements_file(&self, project_dir: &Path) -> Result<Python> {
+        let file = project_dir.join("requirements.txt");
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            return Ok(self.clone());
         };
-        let marker = venv.join(".prepkitty-requirements");
-        let wanted = requirements.join("\n");
-        if venv_python.is_file() && std::fs::read_to_string(&marker).is_ok_and(|m| m == wanted) {
+        if contents.lines().all(|l| {
+            let l = l.trim();
+            l.is_empty() || l.starts_with('#')
+        }) {
+            return Ok(self.clone());
+        }
+        let args = ["-r".to_string(), file.to_string_lossy().into_owned()];
+        self.venv(project_dir, &args, &contents, "requirements.txt")
+    }
+
+    /// Creates `<project>/.venv` and pip-installs `install_args` unless the venv's
+    /// marker already says `marker` was installed.
+    fn venv(
+        &self,
+        project_dir: &Path,
+        install_args: &[String],
+        marker_value: &str,
+        what: &str,
+    ) -> Result<Python> {
+        let venv_python = venv_python(project_dir);
+        let marker = project_dir.join(".venv").join(".prepkitty-requirements");
+        if venv_python.is_file()
+            && std::fs::read_to_string(&marker).is_ok_and(|m| m == marker_value)
+        {
             return Ok(Python {
                 bin: venv_python.to_string_lossy().into_owned(),
             });
         }
 
-        eprintln!(
-            "Installing this project's packages into .venv (first run only): {}",
-            requirements.join(", ")
-        );
+        eprintln!("Installing this project's packages into .venv (first run only): {what}");
+        let venv = project_dir.join(".venv");
         let uv = Command::new("uv")
             .arg("--version")
             .output()
@@ -96,7 +124,7 @@ impl Python {
                 && Command::new("uv")
                     .args(["pip", "install", "--quiet", "--python"])
                     .arg(&venv_python)
-                    .args(requirements)
+                    .args(install_args)
                     .status()?
                     .success()
         } else {
@@ -114,7 +142,7 @@ impl Python {
                         "--quiet",
                         "--disable-pip-version-check",
                     ])
-                    .args(requirements)
+                    .args(install_args)
                     .status()?
                     .success()
         };
@@ -122,10 +150,10 @@ impl Python {
             bail!(
                 "Couldn't install the project's packages. Check your internet connection, or install them yourself:\n  {} -m pip install {}",
                 venv_python.display(),
-                requirements.join(" ")
+                install_args.join(" ")
             );
         }
-        std::fs::write(&marker, wanted)?;
+        std::fs::write(&marker, marker_value)?;
         Ok(Python {
             bin: venv_python.to_string_lossy().into_owned(),
         })
@@ -182,6 +210,25 @@ pub fn parse_report(stdout: &str) -> Option<Vec<TestResult>> {
     serde_json::from_str::<Report>(&stdout[start..end])
         .ok()
         .map(|r| r.results)
+}
+
+fn venv_python(project_dir: &Path) -> PathBuf {
+    let venv = project_dir.join(".venv");
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
+}
+
+/// The project's `.venv` scripts folder (where `uvicorn`, `flask`... live), if it has one.
+pub fn venv_bin(project_dir: &Path) -> Option<PathBuf> {
+    let python = venv_python(project_dir);
+    if python.is_file() {
+        python.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
 }
 
 pub fn tail(s: &str, max: usize) -> String {

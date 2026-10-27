@@ -11,7 +11,7 @@ use crate::api::{Api, Item};
 use crate::config;
 
 /// The newest pack format this CLI understands (`schema` in manifest.json).
-pub const SUPPORTED_SCHEMA: u32 = 1;
+pub const SUPPORTED_SCHEMA: u32 = 2;
 
 pub const UPDATE_HINT: &str = "Update it with:\n  macOS / Linux: curl -fsSL https://prepkitty.dev/install.sh | sh\n  Windows: powershell -ExecutionPolicy Bypass -c \"irm https://prepkitty.dev/install.ps1 | iex\"";
 
@@ -40,6 +40,11 @@ pub struct Manifest {
     /// Pip requirements; when present tests run in the project's own `.venv`.
     #[serde(default)]
     pub requirements: Vec<String>,
+    /// The learner picks the framework: `run` and `build` come from their prepkitty.toml.
+    #[serde(default)]
+    pub any_framework: bool,
+    /// How long a project's server may take to start listening (default 10s).
+    pub start_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub stages: Vec<PackStage>,
 }

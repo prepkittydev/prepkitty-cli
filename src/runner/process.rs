@@ -28,6 +28,17 @@ pub fn shell(command: &str) -> Command {
     }
 }
 
+/// Builds a shell command for a script that may chain several commands
+/// (`a && b`), so no `exec`: the exit status is the script's.
+pub fn script(command: &str) -> Command {
+    if cfg!(windows) {
+        return shell(command);
+    }
+    let mut c = Command::new("sh");
+    c.args(["-c", command]);
+    c
+}
+
 pub fn run(mut cmd: Command, cwd: &Path, stdin: Option<&str>, timeout: Duration) -> Result<Output> {
     cmd.current_dir(cwd)
         .stdin(if stdin.is_some() {
