@@ -10,6 +10,11 @@ use serde::Deserialize;
 use crate::api::{Api, Item};
 use crate::config;
 
+/// The newest pack format this CLI understands (`schema` in manifest.json).
+pub const SUPPORTED_SCHEMA: u32 = 1;
+
+pub const UPDATE_HINT: &str = "Update it with:\n  macOS / Linux: curl -fsSL https://prepkitty.dev/install.sh | sh\n  Windows: powershell -ExecutionPolicy Bypass -c \"irm https://prepkitty.dev/install.ps1 | iex\"";
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PackStage {
     pub stage: u32,
@@ -20,6 +25,8 @@ pub struct PackStage {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
+    #[serde(default)]
+    pub schema: u32,
     pub kind: String,
     pub id: String,
     pub title: String,
@@ -46,9 +53,17 @@ impl Pack {
     pub fn open(dir: &Path) -> Result<Pack> {
         let raw = fs::read_to_string(dir.join("manifest.json"))
             .with_context(|| format!("no manifest.json in {}", dir.display()))?;
+        let manifest: Manifest = serde_json::from_str(&raw)?;
+        if manifest.schema > SUPPORTED_SCHEMA {
+            bail!(
+                "{} needs a newer prepkitty (you have {}).\n{UPDATE_HINT}",
+                manifest.title,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
         Ok(Pack {
             dir: dir.to_path_buf(),
-            manifest: serde_json::from_str(&raw)?,
+            manifest,
         })
     }
 

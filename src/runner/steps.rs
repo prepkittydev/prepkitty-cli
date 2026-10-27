@@ -19,6 +19,7 @@ use super::process;
 use super::python::tail;
 use super::Toolchain;
 use crate::api::TestResult;
+use crate::pack::UPDATE_HINT;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,6 +74,28 @@ pub enum Step {
     Wait {
         wait: u64,
     },
+    /// Anything else: a step kind added after this CLI was built, or a malformed step.
+    Unknown(serde_json::Map<String, Value>),
+}
+
+const STEP_KINDS: &[&str] = &["run", "http", "parallel", "python", "redis", "wait"];
+
+/// Explains a step this CLI can't run: either it's a newer kind, or it's broken.
+fn unknown_step(step: &serde_json::Map<String, Value>) -> anyhow::Error {
+    if let Some(kind) = step.keys().find(|k| STEP_KINDS.contains(&k.as_str())) {
+        return anyhow::anyhow!(
+            "this project has a malformed `{kind}` step: {}",
+            Value::Object(step.clone())
+        );
+    }
+    let kind = step
+        .keys()
+        .find(|k| *k != "expect")
+        .map_or("unnamed", |k| k.as_str());
+    anyhow::anyhow!(
+        "this project's tests use a `{kind}` step, which needs a newer prepkitty (you have {}).\n{UPDATE_HINT}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -161,6 +184,18 @@ pub fn run_stage(
     let raw =
         fs::read_to_string(stage_dir.join("tests.json")).context("stage has no tests.json")?;
     let file: StageFile = serde_json::from_str(&raw).context("couldn't read this stage's tests")?;
+    // Fail once, up front, rather than once per test.
+    let unknown = file
+        .tests
+        .iter()
+        .flat_map(|t| &t.steps)
+        .find_map(|s| match s {
+            Step::Unknown(step) => Some(step),
+            _ => None,
+        });
+    if let Some(step) = unknown {
+        return Err(unknown_step(step));
+    }
     let run = expand_run(run_cmd, project_dir, toolchain);
     Ok(file
         .tests
@@ -344,6 +379,7 @@ fn run_test(
             Step::Wait { wait } => {
                 std::thread::sleep(Duration::from_millis((*wait).min(MAX_WAIT_MS)));
             }
+            Step::Unknown(step) => return Err(unknown_step(step)),
         }
     }
     Ok(())
@@ -692,6 +728,25 @@ mod tests {
             err.contains("expected header content-type: text/css"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn unknown_steps_ask_for_an_update() {
+        let raw = r#"{"tests":[{"name":"t","steps":[
+            {"teleport":"GET /","expect":{}},
+            {"run":"{run}"}]}]}"#;
+        let f: StageFile = serde_json::from_str(raw).unwrap();
+        let [Step::Unknown(newer), Step::Unknown(broken)] = &f.tests[0].steps[..] else {
+            panic!("expected two unknown steps, got {:?}", f.tests[0].steps);
+        };
+        let msg = unknown_step(newer).to_string();
+        assert!(
+            msg.contains("`teleport` step") && msg.contains("newer prepkitty"),
+            "{msg}"
+        );
+        assert!(msg.contains("install.sh"), "{msg}");
+        let msg = unknown_step(broken).to_string();
+        assert!(msg.contains("malformed `run` step"), "{msg}");
     }
 
     #[test]
