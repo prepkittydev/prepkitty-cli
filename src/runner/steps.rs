@@ -1,8 +1,10 @@
-//! Declarative project-stage tests (tests.json): run a command, talk HTTP to a
-//! server, or run a unittest file — each test in a fresh temp directory.
+//! Declarative project-stage tests (tests.json): run a command, talk HTTP or
+//! Redis (RESP) to a server, or run a unittest file — each test in a fresh temp
+//! directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -20,6 +22,8 @@ use crate::api::TestResult;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WAIT_MS: u64 = 2000;
 
 #[derive(Debug, Deserialize)]
 pub struct StageFile {
@@ -42,15 +46,32 @@ pub enum Step {
     Run {
         run: String,
         stdin: Option<String>,
+        /// Extra environment variables; "" hides a variable the learner may have set.
+        #[serde(default)]
+        env: BTreeMap<String, String>,
         expect: RunExpect,
     },
-    Http {
-        http: String,
-        body: Option<Value>,
-        expect: HttpExpect,
+    Http(HttpStep),
+    /// Sends every request at once, each on its own connection, and checks
+    /// that they all finish within `withinMs` (proves the server is concurrent).
+    Parallel {
+        parallel: Vec<HttpStep>,
+        #[serde(rename = "withinMs")]
+        within_ms: Option<u64>,
     },
     Python {
         python: String,
+    },
+    /// Sends one command as a RESP array and checks the single reply.
+    Redis {
+        redis: Vec<String>,
+        /// Named connection, so a test can interleave clients (default "main").
+        conn: Option<String>,
+        expect: RedisExpect,
+    },
+    /// Sleeps for this many milliseconds (e.g. to let a key expire).
+    Wait {
+        wait: u64,
     },
 }
 
@@ -70,6 +91,26 @@ pub struct HttpExpect {
     pub status: Option<u16>,
     pub json: Option<Value>,
     pub body_contains: Option<Vec<String>>,
+    /// Header name -> expected value prefix, both case-insensitive, so
+    /// "text/html" matches "text/html; charset=utf-8".
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HttpStep {
+    pub http: String,
+    pub body: Option<Value>,
+    /// Extra request headers, e.g. `Connection: close`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub expect: HttpExpect,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RedisExpect {
+    /// The exact raw reply, e.g. "+PONG\r\n" or "$-1\r\n".
+    pub reply: String,
 }
 
 /// Expands `{run}` so it works from any cwd: `python3` becomes the detected
@@ -188,44 +229,68 @@ fn run_test(
     let http = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
+    let mut redis: HashMap<String, BufReader<TcpStream>> = HashMap::new();
 
     for step in &t.steps {
         match step {
             Step::Run {
                 run: cmd,
                 stdin,
+                env,
                 expect,
             } => {
-                let out = process::run(
-                    process::shell(&cmd.replace("{run}", run)),
-                    tmp.path(),
-                    stdin.as_deref(),
-                    STEP_TIMEOUT,
-                )?;
+                let mut command = process::shell(&cmd.replace("{run}", run));
+                command.envs(env);
+                let out = process::run(command, tmp.path(), stdin.as_deref(), STEP_TIMEOUT)?;
                 check_run(&cmd.replace("{run}", run_display), &out, expect)?;
             }
-            Step::Http {
-                http: line,
-                body,
-                expect,
-            } => {
+            Step::Http(step) => {
                 let server = server.as_ref().context("http steps need `server: true`")?;
-                let (method, path) = line.split_once(' ').unwrap_or(("GET", line));
-                let url = format!("http://127.0.0.1:{}{}", server.port, path);
-                let mut req = http.request(method.parse()?, &url);
-                req = match body {
-                    Some(Value::String(s)) => {
-                        req.header("Content-Type", "text/plain").body(s.clone())
+                send_http(&http, server.port, step)?;
+            }
+            Step::Parallel {
+                parallel,
+                within_ms,
+            } => {
+                let server = server
+                    .as_ref()
+                    .context("parallel steps need `server: true`")?;
+                let start = Instant::now();
+                // A client per request, so every request gets its own connection.
+                let results: Vec<Result<()>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = parallel
+                        .iter()
+                        .map(|step| {
+                            scope.spawn(move || {
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(Duration::from_secs(5))
+                                    .build()?;
+                                send_http(&client, server.port, step)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("request thread panicked")))
+                        })
+                        .collect()
+                });
+                for r in results {
+                    r?;
+                }
+                let elapsed = start.elapsed();
+                if let Some(limit) = within_ms {
+                    if elapsed > Duration::from_millis(*limit) {
+                        anyhow::bail!(
+                            "{} requests sent at the same time took {}ms in total, but should finish within {limit}ms. \
+                             Is your server handling one connection at a time?",
+                            parallel.len(),
+                            elapsed.as_millis()
+                        );
                     }
-                    Some(v) => req.json(v),
-                    None => req,
-                };
-                let resp = req
-                    .send()
-                    .with_context(|| format!("{line} failed: is your server still running?"))?;
-                let status = resp.status().as_u16();
-                let text = resp.text().unwrap_or_default();
-                check_http(line, status, &text, expect)?;
+                }
             }
             Step::Python { python: file } => {
                 let Toolchain::Python(python) = toolchain else {
@@ -241,9 +306,111 @@ fn run_test(
                     anyhow::bail!("{}: {}", bad.name, bad.message.clone().unwrap_or_default());
                 }
             }
+            Step::Redis {
+                redis: args,
+                conn,
+                expect,
+            } => {
+                let server = server.as_ref().context("redis steps need `server: true`")?;
+                let name = conn.as_deref().unwrap_or("main");
+                let stream = match redis.entry(name.to_string()) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let s = TcpStream::connect(("127.0.0.1", server.port))
+                            .context("couldn't connect to your server")?;
+                        s.set_read_timeout(Some(REDIS_TIMEOUT))?;
+                        e.insert(BufReader::new(s))
+                    }
+                };
+                let line = match conn {
+                    Some(c) => format!("{} (client {c})", args.join(" ")),
+                    None => args.join(" "),
+                };
+                stream
+                    .get_mut()
+                    .write_all(&encode_command(args))
+                    .with_context(|| {
+                        format!("{line}: couldn't send: is your server still running?")
+                    })?;
+                let got = read_reply(stream).map_err(|e| anyhow::anyhow!("{line}: {e}"))?;
+                if got != expect.reply {
+                    anyhow::bail!(
+                        "{line}: expected reply {:?}\n  but got        {:?}",
+                        expect.reply,
+                        got
+                    );
+                }
+            }
+            Step::Wait { wait } => {
+                std::thread::sleep(Duration::from_millis((*wait).min(MAX_WAIT_MS)));
+            }
         }
     }
     Ok(())
+}
+
+/// Encodes a command the way redis-cli sends it: an array of bulk strings.
+fn encode_command(args: &[String]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+    }
+    out
+}
+
+/// Reads exactly one RESP reply and returns its raw text (nested arrays included).
+fn read_reply(r: &mut impl BufRead) -> Result<String> {
+    let mut raw = Vec::new();
+    read_value(r, &mut raw)?;
+    Ok(String::from_utf8_lossy(&raw).into_owned())
+}
+
+fn read_value(r: &mut impl BufRead, raw: &mut Vec<u8>) -> Result<()> {
+    let start = raw.len();
+    let n = r.read_until(b'\n', raw).map_err(io_hint)?;
+    if n == 0 {
+        anyhow::bail!("your server closed the connection without replying");
+    }
+    let line = String::from_utf8_lossy(&raw[start..]).into_owned();
+    let Some(head) = line.strip_suffix("\r\n") else {
+        anyhow::bail!("reply lines must end with \\r\\n, got {line:?}");
+    };
+    let count = || {
+        head[1..]
+            .parse::<i64>()
+            .with_context(|| format!("bad length in {line:?}"))
+    };
+    match head.as_bytes().first() {
+        Some(b'+' | b'-' | b':') => Ok(()),
+        Some(b'$') => {
+            let len = count()?;
+            if len >= 0 {
+                let mut buf = vec![0; len as usize + 2];
+                r.read_exact(&mut buf).map_err(io_hint)?;
+                raw.extend_from_slice(&buf);
+            }
+            Ok(())
+        }
+        Some(b'*') => {
+            for _ in 0..count()?.max(0) {
+                read_value(r, raw)?;
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("{line:?} isn't a RESP reply (it should start with + - : $ or *)"),
+    }
+}
+
+fn io_hint(e: std::io::Error) -> anyhow::Error {
+    match e.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => anyhow::anyhow!(
+            "no complete reply within {}s. Does every reply end with \\r\\n? \
+             Can your server serve a second client while another is connected?",
+            REDIS_TIMEOUT.as_secs()
+        ),
+        ErrorKind::UnexpectedEof => anyhow::anyhow!("your server closed the connection mid-reply"),
+        _ => e.into(),
+    }
 }
 
 fn free_port() -> Result<u16> {
@@ -354,6 +521,51 @@ fn check_run(cmd: &str, out: &process::Output, e: &RunExpect) -> Result<()> {
     Ok(())
 }
 
+fn send_http(client: &reqwest::blocking::Client, port: u16, step: &HttpStep) -> Result<()> {
+    let line = &step.http;
+    let (method, path) = line.split_once(' ').unwrap_or(("GET", line));
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let mut req = client.request(method.parse()?, &url);
+    req = match &step.body {
+        Some(Value::String(s)) => req.header("Content-Type", "text/plain").body(s.clone()),
+        Some(v) => req.json(v),
+        None => req,
+    };
+    for (name, value) in &step.headers {
+        req = req.header(name, value);
+    }
+    let resp = req
+        .send()
+        .with_context(|| format!("{line} failed: is your server still running?"))?;
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let text = resp.text().unwrap_or_default();
+    check_http(line, status, &text, &step.expect)?;
+    check_headers(line, &headers, &step.expect.headers)
+}
+
+fn check_headers(
+    line: &str,
+    got: &reqwest::header::HeaderMap,
+    want: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (name, prefix) in want {
+        let Some(value) = got.get(name.as_str()) else {
+            anyhow::bail!("{line}: expected a {name} header, but the response has none");
+        };
+        let value = String::from_utf8_lossy(value.as_bytes());
+        if !value
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+        {
+            anyhow::bail!(
+                "{line}: expected header {name}: {prefix}\n  but got         {name}: {value}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn check_http(line: &str, status: u16, body: &str, e: &HttpExpect) -> Result<()> {
     if let Some(want) = e.status {
         if status != want {
@@ -420,13 +632,97 @@ mod tests {
     fn parses_all_step_kinds() {
         let raw = r#"{"tests":[{"name":"t","files":{"a.txt":"x"},"server":true,"steps":[
             {"run":"{run} -c a.txt","expect":{"exitCode":0,"stdout":"1 a.txt\n"}},
-            {"http":"GET /health","expect":{"status":200,"json":{"status":"ok"}}},
-            {"python":"test_x.py"}]}]}"#;
+            {"run":"{run}","env":{"TOKEN":""},"expect":{}},
+            {"http":"GET /health","headers":{"Connection":"close"},"expect":{"status":200,"headers":{"Content-Type":"text/html"}}},
+            {"parallel":[{"http":"GET /slow","expect":{}}],"withinMs":1500},
+            {"python":"test_x.py"},
+            {"redis":["SET","k","v"],"conn":"b","expect":{"reply":"+OK\r\n"}},
+            {"wait":200}]}]}"#;
         let f: StageFile = serde_json::from_str(raw).unwrap();
-        assert_eq!(f.tests[0].steps.len(), 3);
+        assert_eq!(f.tests[0].steps.len(), 7);
         assert!(matches!(f.tests[0].steps[0], Step::Run { .. }));
-        assert!(matches!(f.tests[0].steps[1], Step::Http { .. }));
-        assert!(matches!(f.tests[0].steps[2], Step::Python { .. }));
+        assert!(matches!(&f.tests[0].steps[1], Step::Run { env, .. } if env["TOKEN"].is_empty()));
+        assert!(matches!(&f.tests[0].steps[2], Step::Http(h) if h.expect.headers.len() == 1));
+        assert!(matches!(
+            &f.tests[0].steps[3],
+            Step::Parallel { parallel, within_ms: Some(1500) } if parallel.len() == 1
+        ));
+        assert!(matches!(f.tests[0].steps[4], Step::Python { .. }));
+        assert!(matches!(f.tests[0].steps[5], Step::Redis { .. }));
+        assert!(matches!(f.tests[0].steps[6], Step::Wait { wait: 200 }));
+    }
+
+    /// Answers every connection with one canned HTTP response.
+    fn canned_server(response: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                    line.clear();
+                }
+                let _ = reader.get_mut().write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn http_step_checks_header_prefixes() {
+        let port = canned_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/HTML; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        let client = reqwest::blocking::Client::new();
+        let step = |want: &str| HttpStep {
+            http: "GET /".into(),
+            body: None,
+            headers: BTreeMap::new(),
+            expect: HttpExpect {
+                headers: [("content-type".to_string(), want.to_string())].into(),
+                ..Default::default()
+            },
+        };
+        assert!(send_http(&client, port, &step("text/html")).is_ok());
+        let err = send_http(&client, port, &step("text/css"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("expected header content-type: text/css"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn encodes_commands_as_bulk_arrays() {
+        let cmd = encode_command(&["ECHO".into(), "hey".into()]);
+        assert_eq!(cmd, b"*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n");
+    }
+
+    #[test]
+    fn reads_one_resp_reply_at_a_time() {
+        let mut r = BufReader::new(
+            &b"+PONG\r\n$-1\r\n$5\r\nhi\r\no\r\n*2\r\n:1\r\n*1\r\n$1\r\nx\r\n-ERR no\r\n"[..],
+        );
+        assert_eq!(read_reply(&mut r).unwrap(), "+PONG\r\n");
+        assert_eq!(read_reply(&mut r).unwrap(), "$-1\r\n");
+        assert_eq!(read_reply(&mut r).unwrap(), "$5\r\nhi\r\no\r\n");
+        assert_eq!(read_reply(&mut r).unwrap(), "*2\r\n:1\r\n*1\r\n$1\r\nx\r\n");
+        assert_eq!(read_reply(&mut r).unwrap(), "-ERR no\r\n");
+        assert!(read_reply(&mut r)
+            .unwrap_err()
+            .to_string()
+            .contains("closed"));
+    }
+
+    #[test]
+    fn rejects_replies_without_crlf() {
+        let mut r = BufReader::new(&b"+PONG\n"[..]);
+        assert!(read_reply(&mut r)
+            .unwrap_err()
+            .to_string()
+            .contains("\\r\\n"));
     }
 
     #[test]
