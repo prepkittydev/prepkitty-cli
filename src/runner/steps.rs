@@ -94,10 +94,13 @@ pub enum Step {
     Http(HttpStep),
     /// Sends every request at once, each on its own connection, and checks
     /// that they all finish within `withinMs` (proves the server is concurrent).
+    /// `minMs` fails it when they finish too fast (e.g. a `/slow` route that doesn't wait).
     Parallel {
         parallel: Vec<HttpStep>,
         #[serde(rename = "withinMs")]
         within_ms: Option<u64>,
+        #[serde(rename = "minMs")]
+        min_ms: Option<u64>,
     },
     Python {
         python: String,
@@ -336,9 +339,7 @@ fn run_test(
     } else {
         None
     };
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let http = http_client()?;
     let mut redis: HashMap<String, BufReader<TcpStream>> = HashMap::new();
 
     for step in &t.steps {
@@ -362,6 +363,7 @@ fn run_test(
             Step::Parallel {
                 parallel,
                 within_ms,
+                min_ms,
             } => {
                 let server = server
                     .as_ref()
@@ -372,12 +374,7 @@ fn run_test(
                     let handles: Vec<_> = parallel
                         .iter()
                         .map(|step| {
-                            scope.spawn(move || {
-                                let client = reqwest::blocking::Client::builder()
-                                    .timeout(Duration::from_secs(5))
-                                    .build()?;
-                                send_http(&client, server.port, step)
-                            })
+                            scope.spawn(move || send_http(&http_client()?, server.port, step))
                         })
                         .collect();
                     handles
@@ -392,6 +389,16 @@ fn run_test(
                     r?;
                 }
                 let elapsed = start.elapsed();
+                if let Some(min) = min_ms {
+                    if elapsed < Duration::from_millis(*min) {
+                        anyhow::bail!(
+                            "{} requests finished in {}ms, but should take at least {min}ms. \
+                             Does the slow route really wait?",
+                            parallel.len(),
+                            elapsed.as_millis()
+                        );
+                    }
+                }
                 if let Some(limit) = within_ms {
                     if elapsed > Duration::from_millis(*limit) {
                         anyhow::bail!(
@@ -459,6 +466,14 @@ fn run_test(
         }
     }
     Ok(())
+}
+
+/// Never follows redirects, so a test sees the 3xx and its `Location` (and never leaves localhost).
+fn http_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 /// Encodes a command the way redis-cli sends it: an array of bulk strings.
@@ -771,7 +786,7 @@ mod tests {
             {"run":"{run} -c a.txt","expect":{"exitCode":0,"stdout":"1 a.txt\n"}},
             {"run":"{run}","env":{"TOKEN":""},"expect":{}},
             {"http":"GET /health","headers":{"Connection":"close"},"expect":{"status":200,"headers":{"Content-Type":"text/html"}}},
-            {"parallel":[{"http":"GET /slow","expect":{}}],"withinMs":1500},
+            {"parallel":[{"http":"GET /slow","expect":{}}],"withinMs":1500,"minMs":900},
             {"python":"test_x.py"},
             {"redis":["SET","k","v"],"conn":"b","expect":{"reply":"+OK\r\n"}},
             {"wait":200}]}]}"#;
@@ -782,7 +797,7 @@ mod tests {
         assert!(matches!(&f.tests[0].steps[2], Step::Http(h) if h.expect.headers.len() == 1));
         assert!(matches!(
             &f.tests[0].steps[3],
-            Step::Parallel { parallel, within_ms: Some(1500) } if parallel.len() == 1
+            Step::Parallel { parallel, within_ms: Some(1500), min_ms: Some(900) } if parallel.len() == 1
         ));
         assert!(matches!(f.tests[0].steps[4], Step::Python { .. }));
         assert!(matches!(f.tests[0].steps[5], Step::Redis { .. }));
@@ -804,6 +819,19 @@ mod tests {
             }
         });
         port
+    }
+
+    #[test]
+    fn http_steps_see_redirects_instead_of_following_them() {
+        let port = canned_server(
+            "HTTP/1.1 302 Found\r\nLocation: https://example.com/a\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let step: HttpStep = serde_json::from_value(json!({
+            "http": "GET /g8",
+            "expect": {"status": 302, "headers": {"Location": "https://example.com/a"}}
+        }))
+        .unwrap();
+        send_http(&http_client().unwrap(), port, &step).unwrap();
     }
 
     #[test]

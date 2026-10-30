@@ -11,7 +11,8 @@ use crate::api::{Api, Item};
 use crate::config;
 
 /// The newest pack format this CLI understands (`schema` in manifest.json).
-pub const SUPPORTED_SCHEMA: u32 = 2;
+/// 3 added lesson checkpoints (kind "lesson", run like exercises).
+pub const SUPPORTED_SCHEMA: u32 = 3;
 
 pub const UPDATE_HINT: &str = "Update it with:\n  macOS / Linux: curl -fsSL https://prepkitty.dev/install.sh | sh\n  Windows: powershell -ExecutionPolicy Bypass -c \"irm https://prepkitty.dev/install.ps1 | iex\"";
 
@@ -32,7 +33,7 @@ pub struct Manifest {
     pub title: String,
     pub language: String,
     pub pack_hash: String,
-    // exercise
+    // exercise and lesson checkpoint
     pub entry: Option<String>,
     pub timeout_seconds: Option<u64>,
     // project
@@ -52,6 +53,14 @@ pub struct Manifest {
 pub struct Pack {
     pub dir: PathBuf,
     pub manifest: Manifest,
+}
+
+impl Manifest {
+    /// Projects are staged, own their git repo and use the steps runner;
+    /// exercises and lesson checkpoints share the language workspace and unit tests.
+    pub fn is_project(&self) -> bool {
+        self.kind == "project"
+    }
 }
 
 impl Pack {
@@ -172,4 +181,37 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_manifest(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("manifest.json"), json).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lesson_checkpoints_run_like_exercises() {
+        let dir = write_manifest(
+            r#"{"schema":3,"kind":"lesson","id":"py-loops","title":"Loops","language":"python","packHash":"x","entry":"solution.py","timeoutSeconds":10}"#,
+        );
+        let pack = Pack::open(dir.path()).unwrap();
+        assert!(!pack.manifest.is_project());
+        assert_eq!(pack.manifest.entry.as_deref(), Some("solution.py"));
+    }
+
+    #[test]
+    fn newer_schemas_ask_to_update() {
+        let dir = write_manifest(
+            r#"{"schema":4,"kind":"lesson","id":"x","title":"Future","language":"python","packHash":"x"}"#,
+        );
+        let Err(err) = Pack::open(dir.path()) else {
+            panic!("schema 4 opened");
+        };
+        let err = err.to_string();
+        assert!(err.contains("needs a newer prepkitty"), "{err}");
+    }
 }

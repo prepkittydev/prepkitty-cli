@@ -247,18 +247,8 @@ pub fn start(id: &str, dir: Option<PathBuf>) -> Result<ExitCode> {
     let m = &pack.manifest;
     let here = cwd()?;
 
-    let target = if m.kind == "exercise" {
-        let ws = match workspace::find_workspace(&here) {
-            Some(ws) => ws,
-            None => {
-                let ws = dir
-                    .clone()
-                    .unwrap_or_else(|| here.join(format!("prepkitty-{}", m.language)));
-                create_workspace(&ws, &m.language)?;
-                ws
-            }
-        };
-        ws.join(&m.id)
+    let target = if !m.is_project() {
+        exercise_workspace(&here, dir.as_deref(), &m.language)?.join(&m.id)
     } else {
         dir.unwrap_or_else(|| here.join(&m.id))
     };
@@ -276,7 +266,7 @@ pub fn start(id: &str, dir: Option<PathBuf>) -> Result<ExitCode> {
             language: m.language.clone(),
             run: m.run.clone(),
             build: None,
-            stage: if m.kind == "project" {
+            stage: if m.is_project() {
                 Some(item.current_stage.unwrap_or(1))
             } else {
                 None
@@ -284,7 +274,7 @@ pub fn start(id: &str, dir: Option<PathBuf>) -> Result<ExitCode> {
         };
         workspace::write_config(&target, &config)?;
     }
-    if m.kind == "project" {
+    if m.is_project() {
         if !target.join(".gitignore").exists() {
             fs::write(target.join(".gitignore"), GITIGNORE)?;
         }
@@ -305,7 +295,7 @@ pub fn start(id: &str, dir: Option<PathBuf>) -> Result<ExitCode> {
         .entry
         .clone()
         .unwrap_or_else(|| "the starter files".into());
-    let first = if m.kind == "project" {
+    let first = if m.is_project() {
         format!(
             "Read README.md, then stage {}.",
             item.current_stage.unwrap_or(1)
@@ -333,6 +323,23 @@ pub fn start(id: &str, dir: Option<PathBuf>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The shared workspace exercises and lesson checkpoints go into: the one `here` is inside,
+/// else `--dir` or `prepkitty-<language>/` next to `here`, created on first use. Running
+/// `start` again from the same parent folder reuses that workspace.
+fn exercise_workspace(here: &Path, dir: Option<&Path>, language: &str) -> Result<PathBuf> {
+    if let Some(ws) = workspace::find_workspace(here) {
+        return Ok(ws);
+    }
+    let ws = dir.map_or_else(
+        || here.join(format!("prepkitty-{language}")),
+        Path::to_path_buf,
+    );
+    if !ws.join(workspace::WORKSPACE_MARKER).exists() {
+        create_workspace(&ws, language)?;
+    }
+    Ok(ws)
+}
+
 fn create_workspace(ws: &Path, language: &str) -> Result<()> {
     fs::create_dir_all(ws)?;
     fs::write(
@@ -351,7 +358,9 @@ fn create_workspace(ws: &Path, language: &str) -> Result<()> {
     if !git::is_repo(ws) {
         git::init(ws)?;
     }
-    git::commit_all(ws, "Start PrepKitty workspace")?;
+    if git::dirty_files(ws).map(|d| !d.is_empty()).unwrap_or(false) {
+        git::commit_all(ws, "Start PrepKitty workspace")?;
+    }
     Ok(())
 }
 
@@ -412,7 +421,7 @@ fn target_stage(
 fn run_tests(pack: &Pack, dir: &Path, stage: u32) -> Result<Vec<TestResult>> {
     let m = &pack.manifest;
     let is_java = m.language == "java";
-    if m.kind == "project" {
+    if m.is_project() {
         let mut run = m.run.clone().context("project pack has no run command")?;
         let mut build = None;
         let mut launch = Launch {
@@ -470,7 +479,7 @@ fn run_tests(pack: &Pack, dir: &Path, stage: u32) -> Result<Vec<TestResult>> {
 
 fn header(pack: &Pack, stage: u32) {
     let m = &pack.manifest;
-    if m.kind == "project" {
+    if m.is_project() {
         let title = m
             .stages
             .iter()
@@ -559,7 +568,7 @@ pub fn submit() -> Result<ExitCode> {
     let item = api.item(&ctx.config.id, false)?;
     let pack = pack::ensure(&api, &item)?;
 
-    if pack.manifest.kind == "project" && item.completed {
+    if pack.manifest.is_project() && item.completed {
         kitty::say(
             Mood::Happy,
             &[
@@ -587,7 +596,7 @@ pub fn submit() -> Result<ExitCode> {
     }
     let sha = git::head_sha(&ctx.dir)?;
 
-    let stage = if pack.manifest.kind == "project" {
+    let stage = if pack.manifest.is_project() {
         target_stage(&ctx, Some(&item), &pack, None)
     } else {
         0
@@ -707,9 +716,10 @@ pub fn next() -> Result<ExitCode> {
     }
     println!("{}", style("Up next").bold());
     for i in &next.items {
-        let how = match i.kind.as_str() {
-            "exercise" | "project" => format!("prepkitty start {}", i.id),
-            _ => i.web_url.clone(),
+        let how = if i.has_pack || matches!(i.kind.as_str(), "exercise" | "project") {
+            format!("prepkitty start {}", i.id)
+        } else {
+            i.web_url.clone()
         };
         println!(
             "  {} {}  {}",
@@ -753,4 +763,24 @@ pub fn dev_run_pack(pack_dir: &Path, dir: &Path, stage: Option<u32>) -> Result<E
     } else {
         ExitCode::from(1)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_reuses_the_workspace_next_to_you() {
+        let root = tempfile::tempdir().unwrap();
+        let first = exercise_workspace(root.path(), None, "python").unwrap();
+        assert_eq!(first, root.path().join("prepkitty-python"));
+        assert!(first.join(workspace::WORKSPACE_MARKER).exists());
+        // A second `start` from the same parent folder must not try to recreate (and re-commit) it.
+        let again = exercise_workspace(root.path(), None, "python").unwrap();
+        assert_eq!(again, first);
+        // From inside the workspace, it's found by walking up.
+        let nested = first.join("py-hello-world");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(exercise_workspace(&nested, None, "python").unwrap(), first);
+    }
 }

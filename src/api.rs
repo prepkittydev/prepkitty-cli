@@ -65,6 +65,9 @@ pub struct NextItem {
     pub title: String,
     pub xp: u32,
     pub web_url: String,
+    /// Lessons with a coding checkpoint are started from the CLI too.
+    #[serde(default)]
+    pub has_pack: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,6 +1,6 @@
 [package]
 name = "prepkitty"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "PrepKitty CLI: start, test and submit coding exercises and projects locally."
 license = "MIT"
